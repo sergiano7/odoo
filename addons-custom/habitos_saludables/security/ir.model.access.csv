@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_habitos_saludables_habitos_saludables,habitos_saludables.habitos_saludables,model_habitos_saludables_habitos_saludables,base.group_user,1,1,1,1
+access_participante,access_participante,model_habitos_participante,base.group_user,1,1,1,1
