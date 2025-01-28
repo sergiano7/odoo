@@ -5,7 +5,8 @@ from datetime import datetime
 from markupsafe import Markup
 from itertools import groupby
 from collections import defaultdict
-from uuid import uuid4
+from random import randrange
+from pprint import pformat
 
 import psycopg2
 import pytz
@@ -110,15 +111,11 @@ class PosOrder(models.Model):
 
     def _prepare_combo_line_uuids(self, order_vals):
         acc = {}
-        for line in order_vals['lines']:
-            if line[0] not in [0, 1]:
-                continue
+        lines = [line[2] for line in order_vals['lines'] if line[0] in [0, 1]]
 
-            line = line[2]
-
-            if line.get('combo_line_ids'):
-                filtered_lines = list(filter(lambda l: l[0] in [0, 1] and l[2].get('id') and l[2].get('id') in line.get('combo_line_ids'), order_vals['lines']))
-                acc[line['uuid']] = [l[2]['uuid'] for l in filtered_lines]
+        for line in lines:
+            if combo_line_ids := line.get('combo_line_ids'):
+                acc[line['uuid']] = [l['uuid'] for l in lines if l.get('id') in combo_line_ids]
 
             line['combo_line_ids'] = False
             line['combo_parent_id'] = False
@@ -314,7 +311,7 @@ class PosOrder(models.Model):
     has_refundable_lines = fields.Boolean('Has Refundable Lines', compute='_compute_has_refundable_lines')
     ticket_code = fields.Char(help='5 digits alphanumeric code to be used by portal user to request an invoice')
     tracking_number = fields.Char(string="Order Number", compute='_compute_tracking_number', search='_search_tracking_number')
-    uuid = fields.Char(string='Uuid', readonly=True, default=lambda self: str(uuid4()), copy=False)
+    uuid = fields.Char(string='Uuid', readonly=True, copy=False)
     email = fields.Char(string='Email', compute="_compute_contact_details", readonly=False, store=True)
     mobile = fields.Char(string='Mobile', compute="_compute_contact_details", readonly=False, store=True)
     is_edited = fields.Boolean(string='Edited', compute='_compute_is_edited')
@@ -968,7 +965,6 @@ class PosOrder(models.Model):
             'res_model': 'account.move',
             'context': "{'move_type':'out_invoice'}",
             'type': 'ir.actions.act_window',
-            'nodestroy': True,
             'target': 'current',
             'res_id': moves and moves.ids[0] or False,
         }
@@ -976,6 +972,9 @@ class PosOrder(models.Model):
     def action_pos_order_cancel(self):
         cancellable_orders = self.filtered(lambda order: order.state == 'draft')
         cancellable_orders.write({'state': 'cancel'})
+        return {
+            'pos.order': cancellable_orders.read(self._load_pos_data_fields(self.config_id.ids[0]), load=False)
+        }
 
     def _apply_invoice_payments(self, is_reverse=False):
         receivable_account = self.env["res.partner"]._find_accounting_partner(self.partner_id).with_company(self.company_id).property_account_receivable_id
@@ -983,9 +982,19 @@ class PosOrder(models.Model):
         if receivable_account.reconcile:
             invoice_receivables = self.account_move.line_ids.filtered(lambda line: line.account_id == receivable_account and not line.reconciled)
             if invoice_receivables:
-                payment_receivables = payment_moves.mapped('line_ids').filtered(lambda line: line.account_id == receivable_account and line.partner_id)
+                credit_line_ids = payment_moves._context.get('credit_line_ids', None)
+                payment_receivables = payment_moves.mapped('line_ids').filtered(
+                    lambda line: (
+                        (credit_line_ids and line.id in credit_line_ids) or
+                        (not credit_line_ids and line.account_id == receivable_account and line.partner_id)
+                    )
+                )
                 (invoice_receivables | payment_receivables).sudo().with_company(self.company_id).reconcile()
         return payment_moves
+
+    @staticmethod
+    def _get_order_log_representation(order):
+        return dict((k, order.get(k)) for k in ("name", "uuid"))
 
     @api.model
     def sync_from_ui(self, orders):
@@ -1001,17 +1010,28 @@ class PosOrder(models.Model):
         :type draft: bool.
         :Returns: list -- list of db-ids for the created and updated orders.
         """
+        sync_token = randrange(100_000_000)  # Use to differentiate 2 parallels calls to this function in the logs
+        _logger.info("PoS synchronisation #%d started for PoS orders references: %s", sync_token, [self._get_order_log_representation(order) for order in orders])
         order_ids = []
-        session_ids = set({order.get('session_id') for order in orders})
         for order in orders:
+            order_log_name = self._get_order_log_representation(order)
+            _logger.debug("PoS synchronisation #%d processing order %s order full data: %s", sync_token, order_log_name, pformat(order))
+
             if len(self._get_refunded_orders(order)) > 1:
                 raise ValidationError(_('You can only refund products from the same order.'))
 
             existing_order = self._get_open_order(order)
             if existing_order and existing_order.state == 'draft':
                 order_ids.append(self._process_order(order, existing_order))
+                _logger.info("PoS synchronisation #%d order %s updated pos.order #%d", sync_token, order_log_name, order_ids[-1])
             elif not existing_order:
                 order_ids.append(self._process_order(order, False))
+                _logger.info("PoS synchronisation #%d order %s created pos.order #%d", sync_token, order_log_name, order_ids[-1])
+            else:
+                # In theory, this situation is unintended
+                # In practice it can happen when "Tip later" option is used
+                order_ids.append(existing_order.id)
+                _logger.info("PoS synchronisation #%d order %s sync ignored for existing PoS order %s (state: %s)", sync_token, order_log_name, existing_order, existing_order.state)
 
         # Sometime pos_orders_ids can be empty.
         pos_order_ids = self.env['pos.order'].browse(order_ids)
@@ -1019,16 +1039,24 @@ class PosOrder(models.Model):
 
         for order in pos_order_ids:
             order._ensure_access_token()
+            if not self.env.context.get('preparation'):
+                order.config_id.notify_synchronisation(order.config_id.current_session_id.id, self.env.context.get('login_number', 0))
 
+        _logger.info("PoS synchronisation #%d finished", sync_token)
+        return pos_order_ids.read_pos_data(orders, config_id)
+
+    def read_pos_data(self, data, config_id):
         # If the previous session is closed, the order will get a new session_id due to _get_valid_session in _process_order
-        is_new_session = any(order.get('session_id') not in session_ids for order in orders)
+        session_ids = set({order.get('session_id') for order in data})
+        is_new_session = any(order.get('session_id') not in session_ids for order in data)
+
         return {
-            'pos.order': pos_order_ids.read(pos_order_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
-            'pos.session': pos_order_ids.session_id._load_pos_data({})['data'] if config_id and is_new_session else [],
-            'pos.payment': pos_order_ids.payment_ids.read(pos_order_ids.payment_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
-            'pos.order.line': pos_order_ids.lines.read(pos_order_ids.lines._load_pos_data_fields(config_id), load=False) if config_id else [],
-            'pos.pack.operation.lot': pos_order_ids.lines.pack_lot_ids.read(pos_order_ids.lines.pack_lot_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
-            "product.attribute.custom.value": pos_order_ids.lines.custom_attribute_value_ids.read(pos_order_ids.lines.custom_attribute_value_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
+            'pos.order': self.read(self._load_pos_data_fields(config_id), load=False) if config_id else [],
+            'pos.session': self.session_id._load_pos_data({})['data'] if config_id and is_new_session else [],
+            'pos.payment': self.payment_ids.read(self.payment_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
+            'pos.order.line': self.lines.read(self.lines._load_pos_data_fields(config_id), load=False) if config_id else [],
+            'pos.pack.operation.lot': self.lines.pack_lot_ids.read(self.lines.pack_lot_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
+            "product.attribute.custom.value": self.lines.custom_attribute_value_ids.read(self.lines.custom_attribute_value_ids._load_pos_data_fields(config_id), load=False) if config_id else [],
         }
 
     @api.model
@@ -1284,7 +1312,7 @@ class PosOrderLine(models.Model):
     refund_orderline_ids = fields.One2many('pos.order.line', 'refunded_orderline_id', 'Refund Order Lines', help='Orderlines in this field are the lines that refunded this orderline.')
     refunded_orderline_id = fields.Many2one('pos.order.line', 'Refunded Order Line', help='If this orderline is a refund, then the refunded orderline is specified in this field.')
     refunded_qty = fields.Float('Refunded Quantity', compute='_compute_refund_qty', help='Number of items refunded in this orderline.')
-    uuid = fields.Char(string='Uuid', readonly=True, default=lambda self: str(uuid4()), copy=False)
+    uuid = fields.Char(string='Uuid', readonly=True, copy=False)
     note = fields.Char('Product Note')
 
     combo_parent_id = fields.Many2one('pos.order.line', string='Combo Parent') # FIXME rename to parent_line_id
@@ -1382,13 +1410,13 @@ class PosOrderLine(models.Model):
             ('company_id', '=', False),
             ('company_id', '=', company_id),
             ('product_id', '=', product_id),
-            ('location_id', '=', src_loc.id),
+            ('location_id', 'in', src_loc.child_internal_location_ids.ids),
         ])
         available_lots = src_loc_quants.\
             filtered(lambda q: float_compare(q.quantity, 0, precision_rounding=q.product_id.uom_id.rounding) > 0).\
             mapped('lot_id')
 
-        return available_lots.read(['id', 'name'])
+        return available_lots.read(['id', 'name', 'product_qty'])
 
     @api.ondelete(at_uninstall=False)
     def _unlink_except_order_state(self):
@@ -1592,6 +1620,7 @@ class PosOrderLine(models.Model):
                         line,
                         partner_id=commercial_partner,
                         currency_id=self.order_id.currency_id,
+                        rate=self.order_id.currency_rate,
                         product_id=line.product_id,
                         tax_ids=line.tax_ids_after_fiscal_position,
                         price_unit=line.price_unit,

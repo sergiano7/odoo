@@ -39,6 +39,7 @@ import {
 } from "../utils/position";
 import { CTYPES } from "../utils/content_types";
 import { withSequence } from "@html_editor/utils/resource";
+import { compareListTypes } from "@html_editor/main/list/utils";
 
 /**
  * @typedef {Object} RangeLike
@@ -498,6 +499,16 @@ export class DeletePlugin extends Plugin {
             }
         }
 
+        const endContainerList = closestElement(endContainer, "UL, OL");
+        if (
+            ["OL", "UL"].includes(startContainer.nodeName) &&
+            endContainerList &&
+            !compareListTypes(startContainer, endContainerList)
+        ) {
+            const newRange = this.document.createRange();
+            newRange.setStart(range.endContainer, endOffset);
+            return { allNodesRemoved, range: newRange };
+        }
         return { allNodesRemoved, range: { ...range, endOffset } };
     }
 
@@ -738,10 +749,13 @@ export class DeletePlugin extends Plugin {
      * @returns {Range}
      */
     includeBlockEnd(block, range) {
-        const { endContainer, endOffset, commonAncestorContainer } = range;
+        const { startContainer, endContainer, endOffset, commonAncestorContainer } = range;
+        const startList = closestElement(startContainer, "UL, OL");
+        const endList = closestElement(endContainer, "UL, OL");
         if (
             block === commonAncestorContainer ||
-            !this.isCursorAtEndOfElement(block, endContainer, endOffset)
+            !this.isCursorAtEndOfElement(block, endContainer, endOffset) ||
+            (startList && endList && !compareListTypes(startList, endList))
         ) {
             return range;
         }
@@ -1151,9 +1165,9 @@ export class DeletePlugin extends Plugin {
 
     onBeforeInputInsertText(ev) {
         if (ev.inputType === "insertText") {
-            const selection = this.dependencies.selection.getEditableSelection();
+            const selection = this.dependencies.selection.getSelectionData().deepEditableSelection;
             if (!selection.isCollapsed) {
-                this.deleteSelection();
+                this.deleteSelection(selection);
             }
             // Default behavior: insert text and trigger input event
         }
